@@ -3079,6 +3079,10 @@ ROULETTE_CONFIG = {
     "column1": {"multiplier": 3, "numbers": [1,4,7,10,13,16,19,22,25,28,31,34]},
     "column2": {"multiplier": 3, "numbers": [2,5,8,11,14,17,20,23,26,29,32,35]},
     "column3": {"multiplier": 3, "numbers": [3,6,9,12,15,18,21,24,27,30,33,36]},
+    # Dozen bets (1-12, 13-24, 25-36) - different from column bets!
+    "dozen1": {"multiplier": 3, "numbers": list(range(1, 13))},   # 1-12
+    "dozen2": {"multiplier": 3, "numbers": list(range(13, 25))},  # 13-24
+    "dozen3": {"multiplier": 3, "numbers": list(range(25, 37))},  # 25-36
 }
 
 # Tower game multiplier chart (4 columns, varying bombs per row)
@@ -6613,6 +6617,130 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await query.answer()
     
+    # Rebet - place the same bet again (handled before bet_amount check since it uses old game data)
+    if action == "rebet":
+        # parts: ['roul', 'rebet', game_id, user_id]
+        if len(parts) < 4:
+            await query.answer("Invalid rebet request!", show_alert=True)
+            return
+        
+        old_game_id = parts[2]
+        old_game = game_sessions.get(old_game_id)
+        
+        if not old_game:
+            await query.answer("Previous game not found!", show_alert=True)
+            return
+        
+        if old_game.get("user_id") != user.id:
+            await query.answer("This is not your game!", show_alert=True)
+            return
+        
+        # Get bet details from old game
+        rebet_amount = old_game.get("bet_amount", 0)
+        rebet_choice = old_game.get("choice")
+        rebet_numbers = old_game.get("choice_numbers")
+        
+        if not rebet_choice or rebet_amount <= 0:
+            await query.answer("Cannot rebet - invalid game data!", show_alert=True)
+            return
+        
+        # Check balance
+        await ensure_user_in_wallets(user.id, user.username, context=context)
+        if user_wallets.get(user.id, 0.0) < rebet_amount:
+            await query.answer(f"❌ Insufficient balance! Need ${rebet_amount:.2f}", show_alert=True)
+            return
+        
+        # Deduct bet
+        user_wallets[user.id] -= rebet_amount
+        save_user_data(user.id)
+        
+        # Generate new result with provably fair
+        seeds = get_user_seeds(user.id)
+        current_nonce = seeds["nonce"]
+        increment_user_nonce(user.id)
+        winning_number = get_provably_fair_result(seeds["server_seed"], seeds["client_seed"], current_nonce, 37)
+        game_id = generate_unique_id("RL")
+        
+        # Determine win/loss
+        win = False
+        multiplier = 0
+        
+        if rebet_choice == "numbers" and rebet_numbers:
+            multiplier_map = {1: 36, 2: 18, 3: 12, 4: 9, 5: 7, 6: 6}
+            multiplier = multiplier_map.get(len(rebet_numbers), 1)
+            if winning_number in rebet_numbers:
+                win = True
+            choice_display = f"Numbers: {', '.join(map(str, sorted(rebet_numbers)))}"
+        elif rebet_choice in ROULETTE_CONFIG:
+            config = ROULETTE_CONFIG[rebet_choice]
+            if winning_number in config["numbers"]:
+                win = True
+                multiplier = config["multiplier"]
+            # Friendly display names
+            if rebet_choice == "dozen1":
+                choice_display = "1-12 (Dozen 1)"
+            elif rebet_choice == "dozen2":
+                choice_display = "13-24 (Dozen 2)"
+            elif rebet_choice == "dozen3":
+                choice_display = "25-36 (Dozen 3)"
+            else:
+                choice_display = rebet_choice.upper()
+        else:
+            choice_display = rebet_choice
+        
+        # Determine color
+        if winning_number == 0:
+            color = "🟢 Green"
+        elif winning_number in ROULETTE_CONFIG["red"]["numbers"]:
+            color = "🔴 Red"
+        else:
+            color = "⚫ Black"
+        
+        # Process win/loss
+        if win:
+            winnings = rebet_amount * multiplier
+            user_wallets[user.id] += winnings
+            result_text = f"🎉 You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+            update_stats_on_bet(user.id, game_id, rebet_amount, True, multiplier=multiplier, context=context)
+        else:
+            result_text = f"😢 You lose ${rebet_amount:.2f}. Better luck next time!"
+            update_stats_on_bet(user.id, game_id, rebet_amount, False, context=context)
+        
+        # Store game session with rebet data
+        game_sessions[game_id] = {
+            "id": game_id, "game_type": "roulette", "user_id": user.id,
+            "bet_amount": rebet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
+            "win": win, "multiplier": multiplier, "choice": rebet_choice, "result": winning_number,
+            "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": current_nonce,
+            "choice_numbers": rebet_numbers
+        }
+        update_pnl(user.id)
+        save_user_data(user.id)
+        
+        # Store provably fair record
+        store_provably_fair_record(game_id, "roulette", seeds["server_seed"], seeds["client_seed"], current_nonce,
+                                   result_data=f"Winning number: {winning_number}, Choice: {rebet_choice}")
+        
+        # Add provably fair button and rebet button
+        pf_button = await create_provably_fair_button(game_id, context)
+        rebet_button = InlineKeyboardButton("🔄 Rebet", callback_data=f"roul_rebet_{game_id}_{user.id}")
+        
+        keyboard = [
+            [pf_button],
+            [rebet_button]
+        ]
+        
+        await safe_edit_message(
+            query,
+            f"🎯 <b>Roulette Result</b> (ID: <code>{game_id}</code>)\n\n"
+            f"🎰 Winning Number: <b>{winning_number}</b> {color}\n"
+            f"🎲 Your Choice: {choice_display}\n"
+            f"💰 Your Bet: ${rebet_amount:.2f}\n\n{result_text}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
     # Get stored bet amount
     bet_amount = context.user_data.get('roulette_bet_amount')
     if not bet_amount:
@@ -6717,7 +6845,7 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         # Map action to choice
         choice_map = {
-            "1-12": "column1", "13-24": "column2", "25-36": "column3",
+            "1-12": "dozen1", "13-24": "dozen2", "25-36": "dozen3",  # Dozen bets (not column bets!)
             "1-18": "low", "19-36": "high",
             "even": "even", "odd": "odd",
             "red": "red", "black": "black"
@@ -6725,13 +6853,13 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Store selection
         if action in choice_map or action in ["1-12", "13-24", "25-36", "1-18", "19-36"]:
-            # Map the selection
+            # Map the selection - FIXED: "1-12" etc are dozen bets, not column bets
             if action == "1-12":
-                choice = "column1"
+                choice = "dozen1"  # Numbers 1-12
             elif action == "13-24":
-                choice = "column2"
+                choice = "dozen2"  # Numbers 13-24
             elif action == "25-36":
-                choice = "column3"
+                choice = "dozen3"  # Numbers 25-36
             elif action == "1-18":
                 choice = "low"
             elif action == "19-36":
@@ -6741,11 +6869,20 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             context.user_data['roulette_selection'] = choice
             
+            # Display friendly name for dozen bets
+            display_name = choice.upper()
+            if choice == "dozen1":
+                display_name = "1-12 (Dozen 1)"
+            elif choice == "dozen2":
+                display_name = "13-24 (Dozen 2)"
+            elif choice == "dozen3":
+                display_name = "25-36 (Dozen 3)"
+            
             # Update menu to show selection
             menu_text = (
                 f"🎯 <b>Roulette Game</b>\n\n"
                 f"💰 Bet Amount: <b>${bet_amount:.2f}</b>\n"
-                f"🎲 Selected: <b>{choice.upper()}</b>\n\n"
+                f"🎲 Selected: <b>{display_name}</b>\n\n"
                 f"Tap <b>Start</b> to play or select a different option:"
             )
             await safe_edit_message(
@@ -6778,6 +6915,12 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     winning_number = get_provably_fair_result(seeds["server_seed"], seeds["client_seed"], current_nonce, 37)
     game_id = generate_unique_id("RL")
     
+    # Ensure choice_numbers is defined (will be None for non-number bets)
+    try:
+        _ = choice_numbers
+    except NameError:
+        choice_numbers = None
+    
     # Determine win/loss
     win = False
     multiplier = 0
@@ -6794,7 +6937,15 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if winning_number in config["numbers"]:
             win = True
             multiplier = config["multiplier"]
-        choice_display = choice.upper()
+        # Friendly display names for dozen bets
+        if choice == "dozen1":
+            choice_display = "1-12 (Dozen 1)"
+        elif choice == "dozen2":
+            choice_display = "13-24 (Dozen 2)"
+        elif choice == "dozen3":
+            choice_display = "25-36 (Dozen 3)"
+        else:
+            choice_display = choice.upper()
     else:
         choice_display = choice
     
@@ -6818,12 +6969,13 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Note: nonce was incremented at game start for provably fair
     
-    # Store game session
+    # Store game session with rebet data
     game_sessions[game_id] = {
         "id": game_id, "game_type": "roulette", "user_id": user.id,
         "bet_amount": bet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
         "win": win, "multiplier": multiplier, "choice": choice, "result": winning_number,
-        "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": current_nonce
+        "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": current_nonce,
+        "choice_numbers": choice_numbers  # Store for rebet
     }
     update_pnl(user.id)
     save_user_data(user.id)
@@ -6832,16 +6984,14 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     store_provably_fair_record(game_id, "roulette", seeds["server_seed"], seeds["client_seed"], current_nonce, 
                                result_data=f"Winning number: {winning_number}, Choice: {choice}")
     
-    # Add provably fair button with green style
+    # Add provably fair button and rebet button (user-specific)
     pf_button = await create_provably_fair_button(game_id, context)
-    # Try to apply style to URL button (may not work, but worth trying)
-    try:
-        pf_button_dict = pf_button.to_dict()
-        pf_button_dict['style'] = 'success'  # GREEN
-        keyboard = [[pf_button_dict]]
-    except:
-        # If styling URL buttons doesn't work, use normal button
-        keyboard = [[pf_button]]
+    rebet_button = InlineKeyboardButton("🔄 Rebet", callback_data=f"roul_rebet_{game_id}_{user.id}")
+    
+    keyboard = [
+        [pf_button],
+        [rebet_button]
+    ]
     
     await safe_edit_message(
         query,
