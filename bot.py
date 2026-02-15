@@ -8675,14 +8675,68 @@ async def group_challenge_playbot_callback(update: Update, context: ContextTypes
     match["game_rolls"] = match.get("rolls", 1)
     match["last_roller"] = None
     match["current_round"] = 1
+    match["bot_rolls_first"] = False  # Default: user rolls first
     
     game_type = match["game_type"].replace("group_challenge_", "")
-    emoji_map = {"dice": "??", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
+    emoji_map = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
     emoji = emoji_map.get(game_type, "🎮")
+    
+    # Show "Bot Rolls First" option
+    keyboard = [
+        [InlineKeyboardButton("🤖 Bot Rolls First", callback_data=f"gc_botfirst_{match_id}")]
+    ]
     
     await query.edit_message_text(
         f"🤖 <b>PLAYING WITH BOT!</b>\n\n"
-        f"<b>Your turn first!</b> Send {match['rolls']} {emoji} to start round 1.",
+        f"<b>Your turn first!</b> Send {match['rolls']} {emoji} to start round 1.\n\n"
+        f"Or tap below to let the bot roll first:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# Callback for "Bot Rolls First" in group challenge PvB mode
+async def group_challenge_botfirst_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    match_id = query.data.replace("gc_botfirst_", "")
+    match = game_sessions.get(match_id)
+    
+    if not match or match.get("status") != "active":
+        await query.answer("This game is no longer available.", show_alert=True)
+        return
+    
+    if user.id != match["host_id"]:
+        await query.answer("Only the host can change who rolls first!", show_alert=True)
+        return
+    
+    # Set bot rolls first
+    match["bot_rolls_first"] = True
+    match["waiting_for"] = "bot"  # Bot should roll first
+    
+    game_type = match["game_type"].replace("group_challenge_", "")
+    emoji_map = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
+    emoji = emoji_map.get(game_type, "🎮")
+    
+    # Bot rolls first
+    rolls = match.get("rolls", 1)
+    total_value = 0
+    roll_values = []
+    
+    for _ in range(rolls):
+        emoji_msg = await context.bot.send_dice(chat_id=query.message.chat_id, emoji=emoji)
+        value = emoji_msg.dice.value
+        roll_values.append(value)
+        total_value += value
+        await asyncio.sleep(3.5)  # Wait for animation
+    
+    match["player_rolls"][0] = roll_values  # 0 = Bot
+    
+    await query.edit_message_text(
+        f"🤖 <b>BOT ROLLED FIRST!</b>\n\n"
+        f"Bot rolled: {roll_values} = <b>{total_value}</b>\n\n"
+        f"<b>Your turn!</b> Send {rolls} {emoji} to respond.",
         parse_mode=ParseMode.HTML
     )
 
@@ -9272,24 +9326,16 @@ async def keno_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_wallets[game["user_id"]] -= game["bet_amount"]
         save_user_data(game["user_id"])
         
-        # Generate a fresh 15-character client seed for this game BEFORE drawing numbers
-        game_client_seed = generate_game_client_seed()
+        # Use pure cryptographically secure randomness for keno
+        # secrets.SystemRandom() uses OS entropy source for true unpredictability
+        secure_random = secrets.SystemRandom()
+        drawn_numbers = sorted(secure_random.sample(range(1, 41), 20))
         
-        # Use server seed from user's provably fair data, but fresh client seed per game
+        # Still store seeds for reference (but drawn numbers are random)
+        game_client_seed = generate_game_client_seed()
         seeds = get_user_seeds(game["user_id"])
         current_nonce = seeds["nonce"]
-        increment_user_nonce(game["user_id"])  # Increment nonce at bet time
-        
-        # Draw 20 numbers from 1-40 deterministically using fresh game client seed
-        # Use nonce * 1000 to ensure consecutive games don't produce overlapping hash inputs
-        drawn_numbers = []
-        offset = 0
-        base_nonce = current_nonce * 1000
-        while len(drawn_numbers) < 20:
-            num = (get_provably_fair_result(seeds["server_seed"], game_client_seed, base_nonce + offset, 40) + 1)
-            if num not in drawn_numbers:
-                drawn_numbers.append(num)
-            offset += 1
+        increment_user_nonce(game["user_id"])
         
         # Calculate matches
         matches = len(set(selected) & set(drawn_numbers))
@@ -15369,6 +15415,7 @@ def main():
     app.add_handler(CallbackQueryHandler(group_challenge_target_callback, pattern=r"^gc_target_")) # NEW - Group challenge target score
     app.add_handler(CallbackQueryHandler(group_challenge_accept_callback, pattern=r"^gc_accept_")) # NEW - Accept group challenge
     app.add_handler(CallbackQueryHandler(group_challenge_playbot_callback, pattern=r"^gc_playbot_")) # NEW - Play with bot
+    app.add_handler(CallbackQueryHandler(group_challenge_botfirst_callback, pattern=r"^gc_botfirst_")) # NEW - Bot rolls first in group PvB
     app.add_handler(CallbackQueryHandler(xdxw_mode_callback, pattern=r"^xdxw_mode_|^xdxw_cancel$")) # NEW - XdX'w mode selection
     app.add_handler(CallbackQueryHandler(xdxw_accept_callback, pattern=r"^xdxw_accept_")) # NEW - XdX'w accept challenge
     app.add_handler(CallbackQueryHandler(xdxw_playbot_callback, pattern=r"^xdxw_playbot_")) # NEW - XdX'w play with bot
