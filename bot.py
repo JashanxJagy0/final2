@@ -8089,9 +8089,11 @@ async def xdxw_bot_first_callback(update: Update, context: ContextTypes.DEFAULT_
             del context.chat_data[f"active_pvb_game_{user.id}"]
             if user.id in active_pvb_games:
                 del active_pvb_games[user.id]
-            user_wallets[user.id] += match['bet_amount']
-            update_pnl(user.id)
-            save_user_data(user.id)
+            refund_amount = match.get('bet_amount', 0)
+            if refund_amount > 0:
+                user_wallets[user.id] += refund_amount
+                update_pnl(user.id)
+                save_user_data(user.id)
             return
     
     match["bot_rolls"] = bot_rolls
