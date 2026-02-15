@@ -3231,14 +3231,23 @@ SINGLE_EMOJI_GAMES = {
 
 # --- Provably Fair System & Game ID Generation ---
 def generate_server_seed():
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=64))
+    """Generate a cryptographically secure 64-character server seed."""
+    return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(64))
 
 def generate_client_seed():
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    """Generate a client seed - used for user's stored client seed (16 chars).
+    Uses cryptographically secure random generation."""
+    return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+
+def generate_game_client_seed():
+    """Generate a fresh 15-character client seed for each new game (mines/keno).
+    This ensures each game has a unique random seed for truly fair results.
+    Uses cryptographically secure random generation for unpredictable results."""
+    return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(15))
 
 def generate_unique_id(prefix='G'):
     timestamp = datetime.now(timezone.utc).strftime('%y%m%d%H%M%S')
-    random_part = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    random_part = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
     return f"{prefix}-{timestamp}-{random_part}"
 
 def create_hash(server_seed, client_seed, nonce):
@@ -9113,18 +9122,21 @@ async def keno_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_wallets[game["user_id"]] -= game["bet_amount"]
         save_user_data(game["user_id"])
         
-        # Use user's provably fair seeds and increment nonce at bet time
+        # Generate a fresh 15-character client seed for this game BEFORE drawing numbers
+        game_client_seed = generate_game_client_seed()
+        
+        # Use server seed from user's provably fair data, but fresh client seed per game
         seeds = get_user_seeds(game["user_id"])
         current_nonce = seeds["nonce"]
-        increment_user_nonce(game["user_id"])  # Increment nonce at bet time to ensure unique results
+        increment_user_nonce(game["user_id"])  # Increment nonce at bet time
         
-        # Draw 20 numbers from 1-40 deterministically
+        # Draw 20 numbers from 1-40 deterministically using fresh game client seed
         # Use nonce * 1000 to ensure consecutive games don't produce overlapping hash inputs
         drawn_numbers = []
         offset = 0
         base_nonce = current_nonce * 1000
         while len(drawn_numbers) < 20:
-            num = (get_provably_fair_result(seeds["server_seed"], seeds["client_seed"], base_nonce + offset, 40) + 1)
+            num = (get_provably_fair_result(seeds["server_seed"], game_client_seed, base_nonce + offset, 40) + 1)
             if num not in drawn_numbers:
                 drawn_numbers.append(num)
             offset += 1
@@ -9146,15 +9158,14 @@ async def keno_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             profit = -game["bet_amount"]
             win = False
         
-        # Update game
+        # Update game - store the game-specific client seed for provably fair verification
         game["status"] = "completed"
         game["drawn_numbers"] = drawn_numbers
         game["matches"] = matches
         game["multiplier"] = multiplier
         game["server_seed"] = seeds["server_seed"]
-        game["client_seed"] = seeds["client_seed"]
+        game["client_seed"] = game_client_seed  # Store game-specific client seed
         game["nonce"] = current_nonce
-        # Note: nonce was incremented at bet time for provably fair
         game["win"] = win
         
         # Update stats
@@ -9858,18 +9869,24 @@ async def mines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total_cells = 25
     
-    # Use user's provably fair seeds and increment nonce at game start
+    # Generate a fresh 15-character client seed for this game BEFORE calculating mines
+    # This ensures each game has a completely unique seed for truly random results
+    game_client_seed = generate_game_client_seed()
+    
+    # Use server seed from user's provably fair data, but fresh client seed per game
     seeds = get_user_seeds(user.id)
     current_nonce = seeds["nonce"]
-    increment_user_nonce(user.id)  # Increment nonce at game start to ensure unique results
-    mine_numbers = generate_mine_positions(seeds["server_seed"], seeds["client_seed"], current_nonce, num_mines)
+    increment_user_nonce(user.id)  # Increment nonce at game start
+    
+    # Calculate mine positions using server seed + fresh game client seed
+    mine_numbers = generate_mine_positions(seeds["server_seed"], game_client_seed, current_nonce, num_mines)
     
     game_id = generate_unique_id("MN")
     game_sessions[game_id] = {
         "id": game_id, "game_type": "mines", "user_id": user.id, "bet_amount": bet_amount,
         "status": "active", "timestamp": str(datetime.now(timezone.utc)), "mines": mine_numbers,
         "picks": [], "total_cells": total_cells, "num_mines": num_mines,
-        "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": current_nonce
+        "server_seed": seeds["server_seed"], "client_seed": game_client_seed, "nonce": current_nonce
     }
     await ensure_user_in_wallets(user.id, user.username, context=context)
     if 'game_sessions' not in user_stats[user.id]: user_stats[user.id]['game_sessions'] = []
@@ -15433,18 +15450,23 @@ async def select_bombs_callback(update: Update, context: ContextTypes.DEFAULT_TY
             
             total_cells = 25
             
-            # Use user's provably fair seeds and increment nonce at game start
+            # Generate a fresh 15-character client seed for this game BEFORE calculating mines
+            game_client_seed = generate_game_client_seed()
+            
+            # Use server seed from user's provably fair data, but fresh client seed per game
             seeds = get_user_seeds(user.id)
             current_nonce = seeds["nonce"]
-            increment_user_nonce(user.id)  # Increment nonce at game start to ensure unique results
-            mine_numbers = generate_mine_positions(seeds["server_seed"], seeds["client_seed"], current_nonce, num_mines)
+            increment_user_nonce(user.id)  # Increment nonce at game start
+            
+            # Calculate mine positions using server seed + fresh game client seed
+            mine_numbers = generate_mine_positions(seeds["server_seed"], game_client_seed, current_nonce, num_mines)
             
             game_id = generate_unique_id("MN")
             game_sessions[game_id] = {
                 "id": game_id, "game_type": "mines", "user_id": user.id, "bet_amount": bet_amount,
                 "status": "active", "timestamp": str(datetime.now(timezone.utc)), "mines": mine_numbers,
                 "picks": [], "total_cells": total_cells, "num_mines": num_mines,
-                "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": current_nonce
+                "server_seed": seeds["server_seed"], "client_seed": game_client_seed, "nonce": current_nonce
             }
             await ensure_user_in_wallets(user.id, user.username, context=context)
             if 'game_sessions' not in user_stats[user.id]: user_stats[user.id]['game_sessions'] = []
