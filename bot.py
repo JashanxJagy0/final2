@@ -3054,6 +3054,7 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode=None, dis
 
 ## NEW FEATURE ##
 # --- Conversation Handler States ---
+# SELECT_WHO_ROLLS_FIRST: Used in PvB game setup to ask user who should roll first (user or bot)
 (SELECT_BOMBS, SELECT_BET_AMOUNT, SELECT_TARGET_SCORE, ASK_AI_PROMPT, CHOOSE_AI_MODEL,
  ADMIN_SET_BALANCE_USER, ADMIN_SET_BALANCE_AMOUNT, ADMIN_SET_DAILY_BONUS, ADMIN_SEARCH_USER,
  ADMIN_BROADCAST_MESSAGE, ADMIN_SET_HOUSE_BALANCE, ADMIN_LIMITS_CHOOSE_TYPE,
@@ -8498,7 +8499,7 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
         "game_rolls": game_rolls,
         "history": [],
         "bot_rolls_first": bot_rolls_first,
-        "waiting_for": "bot" if bot_rolls_first else "user"
+        "waiting_for": "bot" if bot_rolls_first else "user"  # Tracks whose turn: 'bot' or 'user'
     }
     await ensure_user_in_wallets(user.id, user.username, context=context)
     if 'game_sessions' not in user_stats[user.id]: user_stats[user.id]['game_sessions'] = []
@@ -15552,9 +15553,8 @@ async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TY
         
         # Bot rolls
         bot_rolls = []
+        # Use the emoji directly for Telegram sendDice
         telegram_emoji = emoji
-        if emoji == "⚽":
-            telegram_emoji = "⚽"  # Football emoji for sendDice
         
         chat_type = query.message.chat.type if hasattr(query.message.chat, 'type') else "private"
         for i in range(game_rolls):
@@ -15628,6 +15628,23 @@ async def cancel_game_conversation(update: Update, context: ContextTypes.DEFAULT
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        set_menu_owner(query.message, query.from_user.id)
+    elif game_type in ['dice_bot', 'darts', 'football', 'bowling', 'dice', 'goal', 'bowl']:
+        # Return to emoji regular games menu for PvB games
+        text = "🎮 <b>Regular Emoji Games</b>\n\nChoose a game to see how to play:"
+        keyboard = [
+            [apply_button_style(InlineKeyboardButton("🎲 Dice", callback_data="game_dice_bot"), 'success')],
+            [apply_button_style(InlineKeyboardButton("🎯 Darts", callback_data="game_darts"), 'success')],
+            [apply_button_style(InlineKeyboardButton("⚽ Football", callback_data="game_football"), 'success')],
+            [apply_button_style(InlineKeyboardButton("🎳 Bowling", callback_data="game_bowling"), 'success')],
+            [apply_button_style(InlineKeyboardButton("🔙 Back to Emoji Games", callback_data="main_games_emoji"), 'danger')]
+        ]
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=create_styled_keyboard(keyboard)
+        )
+        set_menu_owner(query.message, query.from_user.id)
     else:
         # For other games, return to main menu
         await query.edit_message_text("Game setup cancelled.")
