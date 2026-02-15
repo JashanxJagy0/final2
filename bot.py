@@ -9999,7 +9999,7 @@ def mines_keyboard(game_id, reveal=False):
     num_per_row = 5
     user_id = game.get("user_id")
     buttons = []
-    for i in range(1, total_cells + 1):
+    for i in range(total_cells):  # 0-24 to match mine positions
         if i in game["picks"]: 
             emoji = "✅"
         elif reveal and i in game["mines"]: 
@@ -10146,8 +10146,8 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # NEW: Handle random tile selection
     if action == "random":
-        # Get unpicked tiles
-        unpicked = [i for i in range(1, game["total_cells"] + 1) if i not in game["picks"]]
+        # Get unpicked tiles - use 0-24 to match mine positions
+        unpicked = [i for i in range(game["total_cells"]) if i not in game["picks"]]
         if not unpicked:
             await query.answer("No tiles left to pick!", show_alert=True)
             return
