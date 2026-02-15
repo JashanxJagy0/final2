@@ -3340,8 +3340,11 @@ def generate_mine_positions(server_seed, client_seed, nonce, num_mines):
     """Generate deterministic mine positions for Mines game"""
     positions = []
     offset = 0
+    # Use nonce * 1000 to ensure consecutive games don't produce overlapping hash inputs
+    # This prevents the issue where nonce N uses offsets 0,1,2... which overlap with nonce N+1
+    base_nonce = nonce * 1000
     while len(positions) < num_mines:
-        pos = get_provably_fair_result(server_seed, client_seed, nonce + offset, 25)
+        pos = get_provably_fair_result(server_seed, client_seed, base_nonce + offset, 25)
         if pos not in positions:
             positions.append(pos)
         offset += 1
@@ -3351,8 +3354,10 @@ def generate_tower_positions(server_seed, client_seed, nonce, difficulty, num_fl
     """Generate deterministic snake positions for Tower game"""
     tiles_per_floor = {'easy': 4, 'medium': 3, 'hard': 2}.get(difficulty, 4)
     positions = []
+    # Use nonce * 1000 to ensure consecutive games don't produce overlapping hash inputs
+    base_nonce = nonce * 1000
     for floor in range(num_floors):
-        snake_pos = get_provably_fair_result(server_seed, client_seed, nonce + floor, tiles_per_floor)
+        snake_pos = get_provably_fair_result(server_seed, client_seed, base_nonce + floor, tiles_per_floor)
         positions.append(snake_pos)
     return positions
 
@@ -8000,6 +8005,7 @@ async def xdxw_playbot_callback(update: Update, context: ContextTypes.DEFAULT_TY
     
     # Register as active PvB game
     context.chat_data[f"active_pvb_game_{user.id}"] = match_id
+    active_pvb_games[user.id] = match_id  # Global fallback
     
     # Initialize PvB game state
     match["user_score"] = 0
@@ -8011,10 +8017,91 @@ async def xdxw_playbot_callback(update: Update, context: ContextTypes.DEFAULT_TY
     match["bot_rolls"] = []
     match["bet_amount"] = match["bet_amount_usd"]  # For PvB compatibility
     match["game_mode"] = match.get("mode", "normal")
+    match["bot_rolls_first"] = False  # Default: user rolls first
+    match["waiting_for"] = "user"  # Track whose turn it is
+    
+    # Show message with option for bot to roll first
+    keyboard = [
+        [InlineKeyboardButton("🤖 Bot Rolls First", callback_data=f"xdxw_bot_first_{match_id}")]
+    ]
     
     await query.edit_message_text(
         f"🤖 <b>PLAYING WITH BOT!</b>\n\n"
-        f"<b>Your turn first!</b> Send {match['game_rolls']} {emoji} to start round 1.",
+        f"<b>Your turn first!</b> Send {match['game_rolls']} {emoji} to start round 1.\n\n"
+        f"<i>Or tap the button below if you want the bot to roll first.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# Callback for "Bot Rolls First" in XdX'w PvB mode
+async def xdxw_bot_first_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    match_id = query.data.replace("xdxw_bot_first_", "")
+    match = game_sessions.get(match_id)
+    
+    if not match or match.get("status") != "active":
+        await query.answer("This game is no longer active.", show_alert=True)
+        return
+    
+    if user.id != match.get("host_id"):
+        await query.answer("Only the host can use this button!", show_alert=True)
+        return
+    
+    # Check if the game hasn't started yet (no rolls made)
+    if match.get("user_rolls") or match.get("bot_rolls"):
+        await query.answer("Game has already started! Too late to change.", show_alert=True)
+        return
+    
+    # Set bot to roll first
+    match["bot_rolls_first"] = True
+    match["waiting_for"] = "user"  # After bot rolls, user responds
+    
+    game_type = match["game_type"].replace("xdxw_", "")
+    emoji_map = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
+    emoji = emoji_map.get(game_type, "🎮")
+    game_rolls = match.get("game_rolls", 1)
+    chat_id = query.message.chat_id
+    
+    # Bot rolls first
+    await query.edit_message_text(
+        f"🤖 <b>BOT IS ROLLING FIRST!</b>\n\n"
+        f"Bot is rolling {game_rolls} {emoji}...",
+        parse_mode=ParseMode.HTML
+    )
+    
+    # Perform bot rolls
+    bot_rolls = []
+    chat_type = query.message.chat.type if hasattr(query.message.chat, 'type') else "private"
+    
+    for i in range(game_rolls):
+        animation_wait = await smart_rate_limit(chat_id, chat_type)
+        try:
+            bot_dice_msg = await context.bot.send_dice(chat_id=chat_id, emoji=emoji)
+            bot_rolls.append(bot_dice_msg.dice.value)
+            await asyncio.sleep(animation_wait)
+        except Exception as e:
+            logging.error(f"Error sending dice in PvB game: {e}")
+            await context.bot.send_message(chat_id=chat_id, text="❌ An error occurred. Game terminated.")
+            match['status'] = 'error'
+            del context.chat_data[f"active_pvb_game_{user.id}"]
+            if user.id in active_pvb_games:
+                del active_pvb_games[user.id]
+            user_wallets[user.id] += match['bet_amount']
+            update_pnl(user.id)
+            save_user_data(user.id)
+            return
+    
+    match["bot_rolls"] = bot_rolls
+    bot_total = sum(bot_rolls)
+    bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🤖 Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
+             f"<b>Your turn!</b> Send {game_rolls} {emoji} to respond.",
         parse_mode=ParseMode.HTML
     )
 
@@ -9008,10 +9095,12 @@ async def keno_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         increment_user_nonce(game["user_id"])  # Increment nonce at bet time to ensure unique results
         
         # Draw 20 numbers from 1-40 deterministically
+        # Use nonce * 1000 to ensure consecutive games don't produce overlapping hash inputs
         drawn_numbers = []
         offset = 0
+        base_nonce = current_nonce * 1000
         while len(drawn_numbers) < 20:
-            num = (get_provably_fair_result(seeds["server_seed"], seeds["client_seed"], current_nonce + offset, 40) + 1)
+            num = (get_provably_fair_result(seeds["server_seed"], seeds["client_seed"], base_nonce + offset, 40) + 1)
             if num not in drawn_numbers:
                 drawn_numbers.append(num)
             offset += 1
@@ -12099,8 +12188,10 @@ for i in range(min(10, len(deck))):
 def generate_mine_positions(server_seed, client_seed, nonce, num_mines):
     positions = []
     offset = 0
+    # Use nonce * 1000 to ensure unique results for consecutive games
+    base_nonce = nonce * 1000
     while len(positions) < num_mines:
-        pos = get_provably_fair_result(server_seed, client_seed, nonce + offset, 25)
+        pos = get_provably_fair_result(server_seed, client_seed, base_nonce + offset, 25)
         if pos not in positions:
             positions.append(pos)
         offset += 1
@@ -12112,14 +12203,14 @@ num_mines = 3  # Default, adjust based on your game
 mine_positions = generate_mine_positions(server_seed, client_seed, nonce, num_mines)
 
 print("=== Mines Verification ===")
-print(f"Mine Positions: {{mine_positions}}")
+print(f"Mine Positions: {mine_positions}")
 print("\\nGrid (5x5):")
 for row in range(5):
     row_str = ""
     for col in range(5):
         idx = row * 5 + col
         row_str += "💣 " if idx in mine_positions else "💎 "
-    print(f"Row {{row+1}}: {{row_str}}")
+    print(f"Row {row+1}: {row_str}")
 """
     
     elif game_type == "tower":
@@ -12127,8 +12218,10 @@ for row in range(5):
 def generate_tower_positions(server_seed, client_seed, nonce, difficulty):
     tiles_per_floor = {{'easy': 4, 'medium': 3, 'hard': 2}}.get(difficulty, 3)
     positions = []
+    # Use nonce * 1000 to ensure unique results for consecutive games
+    base_nonce = nonce * 1000
     for floor in range(9):
-        snake_pos = get_provably_fair_result(server_seed, client_seed, nonce + floor, tiles_per_floor)
+        snake_pos = get_provably_fair_result(server_seed, client_seed, base_nonce + floor, tiles_per_floor)
         positions.append(snake_pos)
     return positions
 
@@ -12181,8 +12274,10 @@ print(f"Hash: {{create_hash(server_seed, client_seed, nonce)[:16]}}...")
 def generate_keno_numbers(server_seed, client_seed, nonce, count=10):
     numbers = []
     offset = 0
+    # Use nonce * 1000 to ensure unique results for consecutive games
+    base_nonce = nonce * 1000
     while len(numbers) < count:
-        num = get_provably_fair_result(server_seed, client_seed, nonce + offset, 40) + 1
+        num = get_provably_fair_result(server_seed, client_seed, base_nonce + offset, 40) + 1
         if num not in numbers:
             numbers.append(num)
         offset += 1
@@ -15086,6 +15181,7 @@ def main():
     app.add_handler(CallbackQueryHandler(xdxw_mode_callback, pattern=r"^xdxw_mode_|^xdxw_cancel$")) # NEW - XdX'w mode selection
     app.add_handler(CallbackQueryHandler(xdxw_accept_callback, pattern=r"^xdxw_accept_")) # NEW - XdX'w accept challenge
     app.add_handler(CallbackQueryHandler(xdxw_playbot_callback, pattern=r"^xdxw_playbot_")) # NEW - XdX'w play with bot
+    app.add_handler(CallbackQueryHandler(xdxw_bot_first_callback, pattern=r"^xdxw_bot_first_")) # NEW - XdX'w bot rolls first
     app.add_handler(CallbackQueryHandler(level_all_command, pattern=r"^level_all$")) # NEW
     app.add_handler(CallbackQueryHandler(price_update_callback, pattern=r"^price_update_")) # NEW
     app.add_handler(CallbackQueryHandler(game_info_callback, pattern=r"^game_")); app.add_handler(CallbackQueryHandler(blackjack_callback, pattern=r"^bj_"))
@@ -16418,8 +16514,10 @@ async def pf_verify_calculate_result(update_or_query, context: ContextTypes.DEFA
     elif game == 'keno':
         drawn_numbers = []
         offset = 0
+        # Use nonce * 1000 to match the actual game algorithm
+        base_nonce = nonce * 1000
         while len(drawn_numbers) < 20:
-            num = get_provably_fair_result(server_seed, client_seed, nonce + offset, 40) + 1
+            num = get_provably_fair_result(server_seed, client_seed, base_nonce + offset, 40) + 1
             if num not in drawn_numbers:
                 drawn_numbers.append(num)
             offset += 1
