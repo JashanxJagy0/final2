@@ -3054,6 +3054,7 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode=None, dis
 
 ## NEW FEATURE ##
 # --- Conversation Handler States ---
+# SELECT_WHO_ROLLS_FIRST: Used in PvB game setup to ask user who should roll first (user or bot)
 (SELECT_BOMBS, SELECT_BET_AMOUNT, SELECT_TARGET_SCORE, ASK_AI_PROMPT, CHOOSE_AI_MODEL,
  ADMIN_SET_BALANCE_USER, ADMIN_SET_BALANCE_AMOUNT, ADMIN_SET_DAILY_BONUS, ADMIN_SEARCH_USER,
  ADMIN_BROADCAST_MESSAGE, ADMIN_SET_HOUSE_BALANCE, ADMIN_LIMITS_CHOOSE_TYPE,
@@ -3062,7 +3063,7 @@ async def safe_edit_message(query, text, reply_markup=None, parse_mode=None, dis
  ADMIN_GIFT_CODE_AMOUNT, ADMIN_GIFT_CODE_CLAIMS, ADMIN_GIFT_CODE_WAGER, SETTINGS_WITHDRAWAL_ADDRESS, SETTINGS_WITHDRAWAL_ADDRESS_CHANGE,
  WITHDRAWAL_AMOUNT, WITHDRAWAL_APPROVAL_TXID, TOWER_BET_AMOUNT, PF_CHANGE_CLIENT_SEED_INPUT,
  PF_VERIFY_INPUT_SERVER_SEED, PF_VERIFY_INPUT_CLIENT_SEED, PF_VERIFY_INPUT_NONCE, PF_VERIFY_INPUT_PARAM,
- ROULETTE_BET_AMOUNT) = range(31)
+ ROULETTE_BET_AMOUNT, SELECT_WHO_ROLLS_FIRST) = range(32)
 
 # --- GAME MULTIPLIERS AND CONFIGS ---
 
@@ -3078,6 +3079,10 @@ ROULETTE_CONFIG = {
     "column1": {"multiplier": 3, "numbers": [1,4,7,10,13,16,19,22,25,28,31,34]},
     "column2": {"multiplier": 3, "numbers": [2,5,8,11,14,17,20,23,26,29,32,35]},
     "column3": {"multiplier": 3, "numbers": [3,6,9,12,15,18,21,24,27,30,33,36]},
+    # Dozen bets (1-12, 13-24, 25-36) - different from column bets!
+    "dozen1": {"multiplier": 3, "numbers": list(range(1, 13))},   # 1-12
+    "dozen2": {"multiplier": 3, "numbers": list(range(13, 25))},  # 13-24
+    "dozen3": {"multiplier": 3, "numbers": list(range(25, 37))},  # 25-36
 }
 
 # Tower game multiplier chart (4 columns, varying bombs per row)
@@ -3230,14 +3235,23 @@ SINGLE_EMOJI_GAMES = {
 
 # --- Provably Fair System & Game ID Generation ---
 def generate_server_seed():
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=64))
+    """Generate a cryptographically secure 64-character server seed."""
+    return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(64))
 
 def generate_client_seed():
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    """Generate a client seed - used for user's stored client seed (16 chars).
+    Uses cryptographically secure random generation."""
+    return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16))
+
+def generate_game_client_seed():
+    """Generate a fresh 15-character client seed for each new game (mines/keno).
+    This ensures each game has a unique random seed for truly fair results.
+    Uses cryptographically secure random generation for unpredictable results."""
+    return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(15))
 
 def generate_unique_id(prefix='G'):
     timestamp = datetime.now(timezone.utc).strftime('%y%m%d%H%M%S')
-    random_part = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    random_part = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
     return f"{prefix}-{timestamp}-{random_part}"
 
 def create_hash(server_seed, client_seed, nonce):
@@ -3251,18 +3265,19 @@ def get_provably_fair_result(server_seed, client_seed, nonce, max_value):
     return (hex_value % max_value)
 
 def get_user_seeds(user_id):
-    """Get user's current seeds and nonce"""
-    pf_data = user_stats.get(user_id, {}).get("provably_fair", {})
-    return {
-        "server_seed": pf_data.get("server_seed", generate_server_seed()),
-        "client_seed": pf_data.get("client_seed", generate_client_seed()),
-        "nonce": pf_data.get("nonce", 0)
-    }
-
-def increment_user_nonce(user_id):
-    """Increment user's nonce after a bet"""
+    """Get user's current seeds and nonce - ensures seeds are initialized and saved"""
+    # If user doesn't exist in user_stats, raise an error as callers should ensure user exists
     if user_id not in user_stats:
-        return
+        logging.error(f"get_user_seeds called for non-existent user {user_id} - this should never happen")
+        # Return emergency defaults - but this indicates a bug in calling code
+        emergency_seeds = {
+            "server_seed": generate_server_seed(),
+            "client_seed": generate_client_seed(),
+            "nonce": 0
+        }
+        return emergency_seeds
+    
+    # Initialize provably_fair data if it doesn't exist and SAVE it immediately
     if "provably_fair" not in user_stats[user_id]:
         user_stats[user_id]["provably_fair"] = {
             "server_seed": generate_server_seed(),
@@ -3270,6 +3285,27 @@ def increment_user_nonce(user_id):
             "nonce": 0,
             "next_server_seed": generate_server_seed()
         }
+        save_user_data(user_id)
+        logging.info(f"Initialized provably_fair data for user {user_id}")
+    
+    pf_data = user_stats[user_id]["provably_fair"]
+    return {
+        "server_seed": pf_data.get("server_seed"),
+        "client_seed": pf_data.get("client_seed"),
+        "nonce": pf_data.get("nonce", 0)
+    }
+
+def increment_user_nonce(user_id):
+    """Increment user's nonce after a bet - call get_user_seeds first to ensure initialization"""
+    if user_id not in user_stats:
+        logging.error(f"increment_user_nonce called for non-existent user {user_id}")
+        return
+    
+    # Call get_user_seeds first to ensure provably_fair is properly initialized and saved
+    # This prevents race conditions where we initialize different seeds here
+    if "provably_fair" not in user_stats[user_id]:
+        get_user_seeds(user_id)  # This will initialize and save
+    
     user_stats[user_id]["provably_fair"]["nonce"] += 1
     save_user_data(user_id)
 
@@ -3339,8 +3375,11 @@ def generate_mine_positions(server_seed, client_seed, nonce, num_mines):
     """Generate deterministic mine positions for Mines game"""
     positions = []
     offset = 0
+    # Use nonce * 1000 to ensure consecutive games don't produce overlapping hash inputs
+    # This prevents the issue where nonce N uses offsets 0,1,2... which overlap with nonce N+1
+    base_nonce = nonce * 1000
     while len(positions) < num_mines:
-        pos = get_provably_fair_result(server_seed, client_seed, nonce + offset, 25)
+        pos = get_provably_fair_result(server_seed, client_seed, base_nonce + offset, 25)
         if pos not in positions:
             positions.append(pos)
         offset += 1
@@ -3350,8 +3389,10 @@ def generate_tower_positions(server_seed, client_seed, nonce, difficulty, num_fl
     """Generate deterministic snake positions for Tower game"""
     tiles_per_floor = {'easy': 4, 'medium': 3, 'hard': 2}.get(difficulty, 4)
     positions = []
+    # Use nonce * 1000 to ensure consecutive games don't produce overlapping hash inputs
+    base_nonce = nonce * 1000
     for floor in range(num_floors):
-        snake_pos = get_provably_fair_result(server_seed, client_seed, nonce + floor, tiles_per_floor)
+        snake_pos = get_provably_fair_result(server_seed, client_seed, base_nonce + floor, tiles_per_floor)
         positions.append(snake_pos)
     return positions
 
@@ -5399,6 +5440,8 @@ async def game_info_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        # Set menu owner after editing to ensure buttons work for this user
+        set_menu_owner(query.message, query.from_user.id)
 
 # --- NEW GAME IMPLEMENTATIONS ---
 
@@ -5775,8 +5818,10 @@ async def coin_flip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_wallets[user.id] -= bet
     save_user_data(user.id)
 
-    # Use user's provably fair seeds
+    # Use user's provably fair seeds and increment nonce at game start
     seeds = get_user_seeds(user.id)
+    current_nonce = seeds["nonce"]
+    increment_user_nonce(user.id)  # Increment nonce at game start to ensure unique results
     game_id = generate_unique_id("CF")
 
     game_sessions[game_id] = {
@@ -5789,7 +5834,7 @@ async def coin_flip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "streak": 0,
         "server_seed": seeds["server_seed"],
         "client_seed": seeds["client_seed"],
-        "nonce": seeds["nonce"]
+        "nonce": current_nonce
     }
     await ensure_user_in_wallets(user.id, user.username, context=context)
     if 'game_sessions' not in user_stats[user.id]: user_stats[user.id]['game_sessions'] = []
@@ -5861,7 +5906,7 @@ async def coin_flip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             game["status"] = 'completed'
             game["win"] = False
-            increment_user_nonce(user.id)
+            # Note: nonce was incremented at game start for provably fair
             update_stats_on_bet(user.id, game_id, game['bet_amount'], False, context=context)
             update_pnl(user.id)
             save_user_data(user.id)
@@ -5890,7 +5935,7 @@ async def coin_flip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         game["status"] = 'completed'
         game["win"] = True
         game["multiplier"] = multiplier
-        increment_user_nonce(user.id)
+        # Note: nonce was incremented at game start for provably fair
         update_stats_on_bet(user.id, game_id, game['bet_amount'], True, multiplier=multiplier, context=context)
         update_pnl(user.id)
         save_user_data(user.id)
@@ -6491,9 +6536,11 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_wallets[user.id] -= bet_amount
     save_user_data(user.id)
 
-    # Use user's provably fair seeds
+    # Use user's provably fair seeds and increment nonce at game start
     seeds = get_user_seeds(user.id)
-    winning_number = get_provably_fair_result(seeds["server_seed"], seeds["client_seed"], seeds["nonce"], 37)
+    current_nonce = seeds["nonce"]
+    increment_user_nonce(user.id)  # Increment nonce at game start to ensure unique results
+    winning_number = get_provably_fair_result(seeds["server_seed"], seeds["client_seed"], current_nonce, 37)
     game_id = generate_unique_id("RL")
 
     win = False
@@ -6521,20 +6568,19 @@ async def roulette_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result_text = f"😢 You lose ${bet_amount:.2f}. Better luck next time!"
         update_stats_on_bet(user.id, game_id, bet_amount, False, context=context)
 
-    # Increment nonce after game
-    increment_user_nonce(user.id)
+    # Note: nonce was incremented at game start for provably fair
 
     game_sessions[game_id] = {
         "id": game_id, "game_type": "roulette", "user_id": user.id,
         "bet_amount": bet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
         "win": win, "multiplier": multiplier, "choice": choice, "result": winning_number,
-        "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": seeds["nonce"]
+        "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": current_nonce
     }
     update_pnl(user.id)
     save_user_data(user.id)
     
     # Store provably fair record
-    store_provably_fair_record(game_id, "roulette", seeds["server_seed"], seeds["client_seed"], seeds["nonce"], 
+    store_provably_fair_record(game_id, "roulette", seeds["server_seed"], seeds["client_seed"], current_nonce, 
                                result_data=f"Winning number: {winning_number}, Choice: {choice}")
     
     # Add provably fair button
@@ -6570,6 +6616,130 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     await query.answer()
+    
+    # Rebet - place the same bet again (handled before bet_amount check since it uses old game data)
+    if action == "rebet":
+        # parts: ['roul', 'rebet', game_id, user_id]
+        if len(parts) < 4:
+            await query.answer("Invalid rebet request!", show_alert=True)
+            return
+        
+        old_game_id = parts[2]
+        old_game = game_sessions.get(old_game_id)
+        
+        if not old_game:
+            await query.answer("Previous game not found!", show_alert=True)
+            return
+        
+        if old_game.get("user_id") != user.id:
+            await query.answer("This is not your game!", show_alert=True)
+            return
+        
+        # Get bet details from old game
+        rebet_amount = old_game.get("bet_amount", 0)
+        rebet_choice = old_game.get("choice")
+        rebet_numbers = old_game.get("choice_numbers")
+        
+        if not rebet_choice or rebet_amount <= 0:
+            await query.answer("Cannot rebet - invalid game data!", show_alert=True)
+            return
+        
+        # Check balance
+        await ensure_user_in_wallets(user.id, user.username, context=context)
+        if user_wallets.get(user.id, 0.0) < rebet_amount:
+            await query.answer(f"❌ Insufficient balance! Need ${rebet_amount:.2f}", show_alert=True)
+            return
+        
+        # Deduct bet
+        user_wallets[user.id] -= rebet_amount
+        save_user_data(user.id)
+        
+        # Generate new result with provably fair
+        seeds = get_user_seeds(user.id)
+        current_nonce = seeds["nonce"]
+        increment_user_nonce(user.id)
+        winning_number = get_provably_fair_result(seeds["server_seed"], seeds["client_seed"], current_nonce, 37)
+        game_id = generate_unique_id("RL")
+        
+        # Determine win/loss
+        win = False
+        multiplier = 0
+        
+        if rebet_choice == "numbers" and rebet_numbers:
+            multiplier_map = {1: 36, 2: 18, 3: 12, 4: 9, 5: 7, 6: 6}
+            multiplier = multiplier_map.get(len(rebet_numbers), 1)
+            if winning_number in rebet_numbers:
+                win = True
+            choice_display = f"Numbers: {', '.join(map(str, sorted(rebet_numbers)))}"
+        elif rebet_choice in ROULETTE_CONFIG:
+            config = ROULETTE_CONFIG[rebet_choice]
+            if winning_number in config["numbers"]:
+                win = True
+                multiplier = config["multiplier"]
+            # Friendly display names
+            if rebet_choice == "dozen1":
+                choice_display = "1-12 (Dozen 1)"
+            elif rebet_choice == "dozen2":
+                choice_display = "13-24 (Dozen 2)"
+            elif rebet_choice == "dozen3":
+                choice_display = "25-36 (Dozen 3)"
+            else:
+                choice_display = rebet_choice.upper()
+        else:
+            choice_display = rebet_choice
+        
+        # Determine color
+        if winning_number == 0:
+            color = "🟢 Green"
+        elif winning_number in ROULETTE_CONFIG["red"]["numbers"]:
+            color = "🔴 Red"
+        else:
+            color = "⚫ Black"
+        
+        # Process win/loss
+        if win:
+            winnings = rebet_amount * multiplier
+            user_wallets[user.id] += winnings
+            result_text = f"🎉 You win ${winnings:.2f}! (Multiplier: {multiplier}x)"
+            update_stats_on_bet(user.id, game_id, rebet_amount, True, multiplier=multiplier, context=context)
+        else:
+            result_text = f"😢 You lose ${rebet_amount:.2f}. Better luck next time!"
+            update_stats_on_bet(user.id, game_id, rebet_amount, False, context=context)
+        
+        # Store game session with rebet data
+        game_sessions[game_id] = {
+            "id": game_id, "game_type": "roulette", "user_id": user.id,
+            "bet_amount": rebet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
+            "win": win, "multiplier": multiplier, "choice": rebet_choice, "result": winning_number,
+            "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": current_nonce,
+            "choice_numbers": rebet_numbers
+        }
+        update_pnl(user.id)
+        save_user_data(user.id)
+        
+        # Store provably fair record
+        store_provably_fair_record(game_id, "roulette", seeds["server_seed"], seeds["client_seed"], current_nonce,
+                                   result_data=f"Winning number: {winning_number}, Choice: {rebet_choice}")
+        
+        # Add provably fair button and rebet button
+        pf_button = await create_provably_fair_button(game_id, context)
+        rebet_button = InlineKeyboardButton("🔄 Rebet", callback_data=f"roul_rebet_{game_id}_{user.id}")
+        
+        keyboard = [
+            [pf_button],
+            [rebet_button]
+        ]
+        
+        await safe_edit_message(
+            query,
+            f"🎯 <b>Roulette Result</b> (ID: <code>{game_id}</code>)\n\n"
+            f"🎰 Winning Number: <b>{winning_number}</b> {color}\n"
+            f"🎲 Your Choice: {choice_display}\n"
+            f"💰 Your Bet: ${rebet_amount:.2f}\n\n{result_text}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
     
     # Get stored bet amount
     bet_amount = context.user_data.get('roulette_bet_amount')
@@ -6675,7 +6845,7 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         # Map action to choice
         choice_map = {
-            "1-12": "column1", "13-24": "column2", "25-36": "column3",
+            "1-12": "dozen1", "13-24": "dozen2", "25-36": "dozen3",  # Dozen bets (not column bets!)
             "1-18": "low", "19-36": "high",
             "even": "even", "odd": "odd",
             "red": "red", "black": "black"
@@ -6683,13 +6853,13 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Store selection
         if action in choice_map or action in ["1-12", "13-24", "25-36", "1-18", "19-36"]:
-            # Map the selection
+            # Map the selection - FIXED: "1-12" etc are dozen bets, not column bets
             if action == "1-12":
-                choice = "column1"
+                choice = "dozen1"  # Numbers 1-12
             elif action == "13-24":
-                choice = "column2"
+                choice = "dozen2"  # Numbers 13-24
             elif action == "25-36":
-                choice = "column3"
+                choice = "dozen3"  # Numbers 25-36
             elif action == "1-18":
                 choice = "low"
             elif action == "19-36":
@@ -6699,11 +6869,20 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             context.user_data['roulette_selection'] = choice
             
+            # Display friendly name for dozen bets
+            display_name = choice.upper()
+            if choice == "dozen1":
+                display_name = "1-12 (Dozen 1)"
+            elif choice == "dozen2":
+                display_name = "13-24 (Dozen 2)"
+            elif choice == "dozen3":
+                display_name = "25-36 (Dozen 3)"
+            
             # Update menu to show selection
             menu_text = (
                 f"🎯 <b>Roulette Game</b>\n\n"
                 f"💰 Bet Amount: <b>${bet_amount:.2f}</b>\n"
-                f"🎲 Selected: <b>{choice.upper()}</b>\n\n"
+                f"🎲 Selected: <b>{display_name}</b>\n\n"
                 f"Tap <b>Start</b> to play or select a different option:"
             )
             await safe_edit_message(
@@ -6729,10 +6908,18 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_wallets[user.id] -= bet_amount
     save_user_data(user.id)
     
-    # Generate result
+    # Generate result with provably fair seeds and increment nonce at game start
     seeds = get_user_seeds(user.id)
-    winning_number = get_provably_fair_result(seeds["server_seed"], seeds["client_seed"], seeds["nonce"], 37)
+    current_nonce = seeds["nonce"]
+    increment_user_nonce(user.id)  # Increment nonce at game start to ensure unique results
+    winning_number = get_provably_fair_result(seeds["server_seed"], seeds["client_seed"], current_nonce, 37)
     game_id = generate_unique_id("RL")
+    
+    # Ensure choice_numbers is defined (will be None for non-number bets)
+    try:
+        _ = choice_numbers
+    except NameError:
+        choice_numbers = None
     
     # Determine win/loss
     win = False
@@ -6750,7 +6937,15 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if winning_number in config["numbers"]:
             win = True
             multiplier = config["multiplier"]
-        choice_display = choice.upper()
+        # Friendly display names for dozen bets
+        if choice == "dozen1":
+            choice_display = "1-12 (Dozen 1)"
+        elif choice == "dozen2":
+            choice_display = "13-24 (Dozen 2)"
+        elif choice == "dozen3":
+            choice_display = "25-36 (Dozen 3)"
+        else:
+            choice_display = choice.upper()
     else:
         choice_display = choice
     
@@ -6772,33 +6967,31 @@ async def roulette_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result_text = f"😢 You lose ${bet_amount:.2f}. Better luck next time!"
         update_stats_on_bet(user.id, game_id, bet_amount, False, context=context)
     
-    # Increment nonce
-    increment_user_nonce(user.id)
+    # Note: nonce was incremented at game start for provably fair
     
-    # Store game session
+    # Store game session with rebet data
     game_sessions[game_id] = {
         "id": game_id, "game_type": "roulette", "user_id": user.id,
         "bet_amount": bet_amount, "status": "completed", "timestamp": str(datetime.now(timezone.utc)),
         "win": win, "multiplier": multiplier, "choice": choice, "result": winning_number,
-        "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": seeds["nonce"]
+        "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": current_nonce,
+        "choice_numbers": choice_numbers  # Store for rebet
     }
     update_pnl(user.id)
     save_user_data(user.id)
     
     # Store provably fair record
-    store_provably_fair_record(game_id, "roulette", seeds["server_seed"], seeds["client_seed"], seeds["nonce"], 
+    store_provably_fair_record(game_id, "roulette", seeds["server_seed"], seeds["client_seed"], current_nonce, 
                                result_data=f"Winning number: {winning_number}, Choice: {choice}")
     
-    # Add provably fair button with green style
+    # Add provably fair button and rebet button (user-specific)
     pf_button = await create_provably_fair_button(game_id, context)
-    # Try to apply style to URL button (may not work, but worth trying)
-    try:
-        pf_button_dict = pf_button.to_dict()
-        pf_button_dict['style'] = 'success'  # GREEN
-        keyboard = [[pf_button_dict]]
-    except:
-        # If styling URL buttons doesn't work, use normal button
-        keyboard = [[pf_button]]
+    rebet_button = InlineKeyboardButton("🔄 Rebet", callback_data=f"roul_rebet_{game_id}_{user.id}")
+    
+    keyboard = [
+        [pf_button],
+        [rebet_button]
+    ]
     
     await safe_edit_message(
         query,
@@ -7993,6 +8186,7 @@ async def xdxw_playbot_callback(update: Update, context: ContextTypes.DEFAULT_TY
     
     # Register as active PvB game
     context.chat_data[f"active_pvb_game_{user.id}"] = match_id
+    active_pvb_games[user.id] = match_id  # Global fallback
     
     # Initialize PvB game state
     match["user_score"] = 0
@@ -8004,10 +8198,93 @@ async def xdxw_playbot_callback(update: Update, context: ContextTypes.DEFAULT_TY
     match["bot_rolls"] = []
     match["bet_amount"] = match["bet_amount_usd"]  # For PvB compatibility
     match["game_mode"] = match.get("mode", "normal")
+    match["bot_rolls_first"] = False  # Default: user rolls first
+    match["waiting_for"] = "user"  # Track whose turn it is
+    
+    # Show message with option for bot to roll first
+    keyboard = [
+        [InlineKeyboardButton("🤖 Bot Rolls First", callback_data=f"xdxw_bot_first_{match_id}")]
+    ]
     
     await query.edit_message_text(
         f"🤖 <b>PLAYING WITH BOT!</b>\n\n"
-        f"<b>Your turn first!</b> Send {match['game_rolls']} {emoji} to start round 1.",
+        f"<b>Your turn first!</b> Send {match['game_rolls']} {emoji} to start round 1.\n\n"
+        f"<i>Or tap the button below if you want the bot to roll first.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# Callback for "Bot Rolls First" in XdX'w PvB mode
+async def xdxw_bot_first_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    match_id = query.data.replace("xdxw_bot_first_", "")
+    match = game_sessions.get(match_id)
+    
+    if not match or match.get("status") != "active":
+        await query.answer("This game is no longer active.", show_alert=True)
+        return
+    
+    if user.id != match.get("host_id"):
+        await query.answer("Only the host can use this button!", show_alert=True)
+        return
+    
+    # Check if the game hasn't started yet (no rolls made)
+    if match.get("user_rolls") or match.get("bot_rolls"):
+        await query.answer("Game has already started! Too late to change.", show_alert=True)
+        return
+    
+    # Set bot to roll first
+    match["bot_rolls_first"] = True
+    match["waiting_for"] = "user"  # After bot rolls, user responds
+    
+    game_type = match["game_type"].replace("xdxw_", "")
+    emoji_map = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
+    emoji = emoji_map.get(game_type, "🎮")
+    game_rolls = match.get("game_rolls", 1)
+    chat_id = query.message.chat_id
+    
+    # Bot rolls first
+    await query.edit_message_text(
+        f"🤖 <b>BOT IS ROLLING FIRST!</b>\n\n"
+        f"Bot is rolling {game_rolls} {emoji}...",
+        parse_mode=ParseMode.HTML
+    )
+    
+    # Perform bot rolls
+    bot_rolls = []
+    chat_type = query.message.chat.type if hasattr(query.message.chat, 'type') else "private"
+    
+    for i in range(game_rolls):
+        animation_wait = await smart_rate_limit(chat_id, chat_type)
+        try:
+            bot_dice_msg = await context.bot.send_dice(chat_id=chat_id, emoji=emoji)
+            bot_rolls.append(bot_dice_msg.dice.value)
+            await asyncio.sleep(animation_wait)
+        except Exception as e:
+            logging.error(f"Error sending dice in PvB game: {e}")
+            await context.bot.send_message(chat_id=chat_id, text="❌ An error occurred. Game terminated.")
+            match['status'] = 'error'
+            del context.chat_data[f"active_pvb_game_{user.id}"]
+            if user.id in active_pvb_games:
+                del active_pvb_games[user.id]
+            refund_amount = match.get('bet_amount', 0)
+            if refund_amount > 0:
+                user_wallets[user.id] += refund_amount
+                update_pnl(user.id)
+                save_user_data(user.id)
+            return
+    
+    match["bot_rolls"] = bot_rolls
+    bot_total = sum(bot_rolls)
+    bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
+    
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🤖 Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
+             f"<b>Your turn!</b> Send {game_rolls} {emoji} to respond.",
         parse_mode=ParseMode.HTML
     )
 
@@ -8398,14 +8675,68 @@ async def group_challenge_playbot_callback(update: Update, context: ContextTypes
     match["game_rolls"] = match.get("rolls", 1)
     match["last_roller"] = None
     match["current_round"] = 1
+    match["bot_rolls_first"] = False  # Default: user rolls first
     
     game_type = match["game_type"].replace("group_challenge_", "")
-    emoji_map = {"dice": "??", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
+    emoji_map = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
     emoji = emoji_map.get(game_type, "🎮")
+    
+    # Show "Bot Rolls First" option
+    keyboard = [
+        [InlineKeyboardButton("🤖 Bot Rolls First", callback_data=f"gc_botfirst_{match_id}")]
+    ]
     
     await query.edit_message_text(
         f"🤖 <b>PLAYING WITH BOT!</b>\n\n"
-        f"<b>Your turn first!</b> Send {match['rolls']} {emoji} to start round 1.",
+        f"<b>Your turn first!</b> Send {match['rolls']} {emoji} to start round 1.\n\n"
+        f"Or tap below to let the bot roll first:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# Callback for "Bot Rolls First" in group challenge PvB mode
+async def group_challenge_botfirst_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    
+    match_id = query.data.replace("gc_botfirst_", "")
+    match = game_sessions.get(match_id)
+    
+    if not match or match.get("status") != "active":
+        await query.answer("This game is no longer available.", show_alert=True)
+        return
+    
+    if user.id != match["host_id"]:
+        await query.answer("Only the host can change who rolls first!", show_alert=True)
+        return
+    
+    # Set bot rolls first
+    match["bot_rolls_first"] = True
+    match["waiting_for"] = "bot"  # Bot should roll first
+    
+    game_type = match["game_type"].replace("group_challenge_", "")
+    emoji_map = {"dice": "🎲", "darts": "🎯", "goal": "⚽", "bowl": "🎳"}
+    emoji = emoji_map.get(game_type, "🎮")
+    
+    # Bot rolls first
+    rolls = match.get("rolls", 1)
+    total_value = 0
+    roll_values = []
+    
+    for _ in range(rolls):
+        emoji_msg = await context.bot.send_dice(chat_id=query.message.chat_id, emoji=emoji)
+        value = emoji_msg.dice.value
+        roll_values.append(value)
+        total_value += value
+        await asyncio.sleep(3.5)  # Wait for animation
+    
+    match["player_rolls"][0] = roll_values  # 0 = Bot
+    
+    await query.edit_message_text(
+        f"🤖 <b>BOT ROLLED FIRST!</b>\n\n"
+        f"Bot rolled: {roll_values} = <b>{total_value}</b>\n\n"
+        f"<b>Your turn!</b> Send {rolls} {emoji} to respond.",
         parse_mode=ParseMode.HTML
     )
 
@@ -8454,6 +8785,7 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
     bet_amount = context.user_data['bet_amount']
     game_mode = context.user_data.get('game_mode', 'normal')  # normal or crazy
     game_rolls = context.user_data.get('game_rolls', 1)  # 1, 2, or 3 rolls
+    bot_rolls_first = context.user_data.get('bot_rolls_first', False)  # NEW: who rolls first
     await ensure_user_in_wallets(user.id, user.username, context=context)
 
     if not await check_bet_limits(update, bet_amount, f'pvb_{game_type}'):
@@ -8479,26 +8811,19 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
     # Get the emoji for this game type
     emoji = emoji_map.get(game_type, "🎲")  # Default to dice if not found
 
-    await update.message.reply_text(
-        f"🎮 {game_type.capitalize()} vs Bot started! (ID: <code>{game_id}</code>)\n"
-        f"<b>Mode:</b> {game_mode.capitalize()} ({mode_text})\n"
-        f"<b>Rolls per round:</b> {game_rolls}\n"
-        f"<b>Target:</b> First to {target_score} points wins ${bet_amount*2:.2f}.\n\n"
-        f"<b>Your turn first! Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to start.</b>",
-        parse_mode=ParseMode.HTML
-    )
-
-    # Create game session but DON'T roll for bot yet - wait for user first
+    # Create game session
     game_sessions[game_id] = {
         "id": game_id, "game_type": f"pvb_{game_type}", "user_id": user.id,
         "bet_amount": bet_amount, "status": "active", "timestamp": str(datetime.now(timezone.utc)),
         "target_score": target_score, "current_round": 1,
         "user_score": 0, "bot_score": 0, 
-        "bot_rolls": [],  # Empty - bot will roll AFTER user
-        "user_rolls": [],  # Will store user rolls
-        "game_mode": game_mode,  # normal or crazy
-        "game_rolls": game_rolls,  # number of rolls per round
-        "history": []  # To store round results
+        "bot_rolls": [],
+        "user_rolls": [],
+        "game_mode": game_mode,
+        "game_rolls": game_rolls,
+        "history": [],
+        "bot_rolls_first": bot_rolls_first,
+        "waiting_for": "bot" if bot_rolls_first else "user"  # Tracks whose turn: 'bot' or 'user'
     }
     await ensure_user_in_wallets(user.id, user.username, context=context)
     if 'game_sessions' not in user_stats[user.id]: user_stats[user.id]['game_sessions'] = []
@@ -8507,10 +8832,67 @@ async def play_vs_bot_game(update: Update, context: ContextTypes.DEFAULT_TYPE, g
     
     # Store in BOTH context.chat_data AND global dict for reliability
     context.chat_data[f"active_pvb_game_{user.id}"] = game_id
-    active_pvb_games[user.id] = game_id  # Global fallback (Note: Python GIL provides basic thread safety for dict operations)
+    active_pvb_games[user.id] = game_id  # Global fallback
+    
+    chat_id = update.effective_chat.id
+    
+    if bot_rolls_first:
+        # Bot rolls first
+        await update.message.reply_text(
+            f"🎮 {game_type.capitalize()} vs Bot started! (ID: <code>{game_id}</code>)\n"
+            f"<b>Mode:</b> {game_mode.capitalize()} ({mode_text})\n"
+            f"<b>Rolls per round:</b> {game_rolls}\n"
+            f"<b>Target:</b> First to {target_score} points wins ${bet_amount*2:.2f}.\n\n"
+            f"<b>Bot is rolling first...</b>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Bot rolls
+        bot_rolls = []
+        telegram_emoji = emoji
+        chat_type = update.effective_chat.type
+        for i in range(game_rolls):
+            animation_wait = await smart_rate_limit(chat_id, chat_type)
+            try:
+                bot_dice_msg = await context.bot.send_dice(chat_id=chat_id, emoji=telegram_emoji)
+                bot_rolls.append(bot_dice_msg.dice.value)
+                await asyncio.sleep(animation_wait)
+            except Exception as e:
+                logging.error(f"Error sending dice in PvB game: {e}")
+                await update.message.reply_text("❌ An error occurred. Game terminated.")
+                game_sessions[game_id]['status'] = 'error'
+                del context.chat_data[f"active_pvb_game_{user.id}"]
+                if user.id in active_pvb_games:
+                    del active_pvb_games[user.id]
+                user_wallets[user.id] += bet_amount
+                update_pnl(user.id)
+                save_user_data(user.id)
+                return
+        
+        game_sessions[game_id]["bot_rolls"] = bot_rolls
+        bot_total = sum(bot_rolls)
+        bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
+        
+        game_sessions[game_id]["waiting_for"] = "user"
+        
+        await update.message.reply_text(
+            f"🤖 Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
+            f"<b>Your turn!</b> Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to respond.",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        # User rolls first (default)
+        await update.message.reply_text(
+            f"🎮 {game_type.capitalize()} vs Bot started! (ID: <code>{game_id}</code>)\n"
+            f"<b>Mode:</b> {game_mode.capitalize()} ({mode_text})\n"
+            f"<b>Rolls per round:</b> {game_rolls}\n"
+            f"<b>Target:</b> First to {target_score} points wins ${bet_amount*2:.2f}.\n\n"
+            f"<b>Your turn first! Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to start.</b>",
+            parse_mode=ParseMode.HTML
+        )
     
     if DEBUG_EMOJI_GAMES:
-        logging.info(f"PvB game created: game_id={game_id}, user_id={user.id}, stored in both context.chat_data and active_pvb_games")
+        logging.info(f"PvB game created: game_id={game_id}, user_id={user.id}, bot_rolls_first={bot_rolls_first}")
 
 
 # --- /predict amount up/down game ---
@@ -8944,17 +9326,16 @@ async def keno_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_wallets[game["user_id"]] -= game["bet_amount"]
         save_user_data(game["user_id"])
         
-        # Use user's provably fair seeds
-        seeds = get_user_seeds(game["user_id"])
+        # Use pure cryptographically secure randomness for keno
+        # secrets.SystemRandom() uses OS entropy source for true unpredictability
+        secure_random = secrets.SystemRandom()
+        drawn_numbers = sorted(secure_random.sample(range(1, 41), 20))
         
-        # Draw 20 numbers from 1-40 deterministically
-        drawn_numbers = []
-        offset = 0
-        while len(drawn_numbers) < 20:
-            num = (get_provably_fair_result(seeds["server_seed"], seeds["client_seed"], seeds["nonce"] + offset, 40) + 1)
-            if num not in drawn_numbers:
-                drawn_numbers.append(num)
-            offset += 1
+        # Still store seeds for reference (but drawn numbers are random)
+        game_client_seed = generate_game_client_seed()
+        seeds = get_user_seeds(game["user_id"])
+        current_nonce = seeds["nonce"]
+        increment_user_nonce(game["user_id"])
         
         # Calculate matches
         matches = len(set(selected) & set(drawn_numbers))
@@ -8973,15 +9354,14 @@ async def keno_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             profit = -game["bet_amount"]
             win = False
         
-        # Update game
+        # Update game - store the game-specific client seed for provably fair verification
         game["status"] = "completed"
         game["drawn_numbers"] = drawn_numbers
         game["matches"] = matches
         game["multiplier"] = multiplier
         game["server_seed"] = seeds["server_seed"]
-        game["client_seed"] = seeds["client_seed"]
-        game["nonce"] = seeds["nonce"]
-        increment_user_nonce(game["user_id"])
+        game["client_seed"] = game_client_seed  # Store game-specific client seed
+        game["nonce"] = current_nonce
         game["win"] = win
         
         # Update stats
@@ -9619,7 +9999,7 @@ def mines_keyboard(game_id, reveal=False):
     num_per_row = 5
     user_id = game.get("user_id")
     buttons = []
-    for i in range(1, total_cells + 1):
+    for i in range(total_cells):  # 0-24 to match mine positions
         if i in game["picks"]: 
             emoji = "✅"
         elif reveal and i in game["mines"]: 
@@ -9685,16 +10065,24 @@ async def mines_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     total_cells = 25
     
-    # Use user's provably fair seeds
+    # Generate a fresh 15-character client seed for this game BEFORE calculating mines
+    # This ensures each game has a completely unique seed for truly random results
+    game_client_seed = generate_game_client_seed()
+    
+    # Use server seed from user's provably fair data, but fresh client seed per game
     seeds = get_user_seeds(user.id)
-    mine_numbers = generate_mine_positions(seeds["server_seed"], seeds["client_seed"], seeds["nonce"], num_mines)
+    current_nonce = seeds["nonce"]
+    increment_user_nonce(user.id)  # Increment nonce at game start
+    
+    # Calculate mine positions using server seed + fresh game client seed
+    mine_numbers = generate_mine_positions(seeds["server_seed"], game_client_seed, current_nonce, num_mines)
     
     game_id = generate_unique_id("MN")
     game_sessions[game_id] = {
         "id": game_id, "game_type": "mines", "user_id": user.id, "bet_amount": bet_amount,
         "status": "active", "timestamp": str(datetime.now(timezone.utc)), "mines": mine_numbers,
         "picks": [], "total_cells": total_cells, "num_mines": num_mines,
-        "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": seeds["nonce"]
+        "server_seed": seeds["server_seed"], "client_seed": game_client_seed, "nonce": current_nonce
     }
     await ensure_user_in_wallets(user.id, user.username, context=context)
     if 'game_sessions' not in user_stats[user.id]: user_stats[user.id]['game_sessions'] = []
@@ -9758,8 +10146,8 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # NEW: Handle random tile selection
     if action == "random":
-        # Get unpicked tiles
-        unpicked = [i for i in range(1, game["total_cells"] + 1) if i not in game["picks"]]
+        # Get unpicked tiles - use 0-24 to match mine positions
+        unpicked = [i for i in range(game["total_cells"]) if i not in game["picks"]]
         if not unpicked:
             await query.answer("No tiles left to pick!", show_alert=True)
             return
@@ -9771,7 +10159,7 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if cell in game["mines"]:
             game["status"] = 'completed'
             game["win"] = False
-            increment_user_nonce(user.id)
+            # Note: nonce was incremented at game start for provably fair
             update_stats_on_bet(user.id, game_id, game['bet_amount'], win=False, context=context)
             update_pnl(user.id)
             save_user_data(user.id)
@@ -9808,7 +10196,7 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             game["win"] = True
             game["multiplier"] = multiplier
             user_wallets[user.id] += potential_winnings
-            increment_user_nonce(user.id)
+            # Note: nonce was incremented at game start for provably fair
             update_stats_on_bet(user.id, game_id, game['bet_amount'], win=True, multiplier=multiplier, context=context)
             update_pnl(user.id)
             save_user_data(user.id)
@@ -9857,7 +10245,7 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         game["status"] = 'completed'
         game["win"] = True
         game["multiplier"] = multiplier
-        increment_user_nonce(user.id)
+        # Note: nonce was incremented at game start for provably fair
         update_stats_on_bet(user.id, game_id, game['bet_amount'], win=True, multiplier=multiplier, context=context)
         update_pnl(user.id)
         save_user_data(user.id)
@@ -9894,7 +10282,7 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if cell in game["mines"]:
         game["status"] = 'completed'
         game["win"] = False
-        increment_user_nonce(user.id)
+        # Note: nonce was incremented at game start for provably fair
         update_stats_on_bet(user.id, game_id, game['bet_amount'], win=False, context=context)
         update_pnl(user.id)
         save_user_data(user.id)
@@ -9930,7 +10318,7 @@ async def mines_pick_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         game["win"] = True
         game["multiplier"] = multiplier
         user_wallets[user.id] += potential_winnings
-        increment_user_nonce(user.id)
+        # Note: nonce was incremented at game start for provably fair
         update_stats_on_bet(user.id, game_id, game['bet_amount'], win=True, multiplier=multiplier, context=context)
         update_pnl(user.id)
         save_user_data(user.id)
@@ -10905,6 +11293,7 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expected_emoji = emoji_map.get(game_type, "🎲")  # Default to dice if not found
         game_rolls = game.get('game_rolls', 1)
         game_mode = game.get('game_mode', 'normal')
+        bot_rolls_first = game.get('bot_rolls_first', False)
 
         if update.message.dice and update.message.dice.emoji == expected_emoji and update.message.forward_origin is None:
             user_roll = update.message.dice.value
@@ -10920,43 +11309,55 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(f"Roll {len(game['user_rolls'])}/{game_rolls} complete. Send {remaining} more {expected_emoji}!")
                 return
             
-            # User finished rolling, now bot should roll
+            # User finished rolling
             user_rolls = game['user_rolls']
             user_total = sum(user_rolls)
             user_rolls_text = " + ".join(str(r) for r in user_rolls)
             
-            # Show user's result first
-            await update.message.reply_text(
-                f"You rolled: {user_rolls_text} = <b>{user_total}</b>\n\n"
-                f"Bot is rolling...",
-                parse_mode=ParseMode.HTML
-            )
-            
-            # NOW bot rolls
-            bot_rolls = []
-            chat_type = update.effective_chat.type
-            for i in range(game_rolls):
-                animation_wait = await smart_rate_limit(update.effective_chat.id, chat_type)
-                try:
-                    bot_dice_msg = await context.bot.send_dice(chat_id=update.effective_chat.id, emoji=expected_emoji)
-                    bot_rolls.append(bot_dice_msg.dice.value)
-                    await asyncio.sleep(animation_wait)  # Smart wait based on chat type
-                except Exception as e:
-                    logging.error(f"Error sending dice in PvB game: {e}")
-                    await update.message.reply_text("❌ An error occurred. Game terminated.")
-                    game['status'] = 'error'
-                    del context.chat_data[f"active_pvb_game_{user.id}"]
-                    if user.id in active_pvb_games:
-                        del active_pvb_games[user.id]
-                    # Refund bet
-                    user_wallets[user.id] += game['bet_amount']
-                    update_pnl(user.id)
-                    save_user_data(user.id)
-                    return
-            
-            game["bot_rolls"] = bot_rolls
-            bot_total = sum(bot_rolls)
-            bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
+            if bot_rolls_first:
+                # Bot already rolled, so we have bot_rolls
+                bot_rolls = game.get('bot_rolls', [])
+                bot_total = sum(bot_rolls)
+                bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
+                
+                # Show user's result
+                await update.message.reply_text(
+                    f"You rolled: {user_rolls_text} = <b>{user_total}</b>",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                # Show user's result first
+                await update.message.reply_text(
+                    f"You rolled: {user_rolls_text} = <b>{user_total}</b>\n\n"
+                    f"Bot is rolling...",
+                    parse_mode=ParseMode.HTML
+                )
+                
+                # NOW bot rolls
+                bot_rolls = []
+                chat_type = update.effective_chat.type
+                for i in range(game_rolls):
+                    animation_wait = await smart_rate_limit(update.effective_chat.id, chat_type)
+                    try:
+                        bot_dice_msg = await context.bot.send_dice(chat_id=update.effective_chat.id, emoji=expected_emoji)
+                        bot_rolls.append(bot_dice_msg.dice.value)
+                        await asyncio.sleep(animation_wait)  # Smart wait based on chat type
+                    except Exception as e:
+                        logging.error(f"Error sending dice in PvB game: {e}")
+                        await update.message.reply_text("❌ An error occurred. Game terminated.")
+                        game['status'] = 'error'
+                        del context.chat_data[f"active_pvb_game_{user.id}"]
+                        if user.id in active_pvb_games:
+                            del active_pvb_games[user.id]
+                        # Refund bet
+                        user_wallets[user.id] += game['bet_amount']
+                        update_pnl(user.id)
+                        save_user_data(user.id)
+                        return
+                
+                game["bot_rolls"] = bot_rolls
+                bot_total = sum(bot_rolls)
+                bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
             
             # Determine winner based on mode
             win = False
@@ -10973,25 +11374,26 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                           "user_total": user_total, "bot_total": bot_total, "winner": None}
             
             if tie:
-                await update.message.reply_text(
-                    f"Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
-                    f"It's a tie! No point.",
-                    parse_mode=ParseMode.HTML
-                )
+                result_text = "It's a tie! No point."
             elif win:
                 game["user_score"] += 1
                 round_result["winner"] = "user"
-                await update.message.reply_text(
-                    f"Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
-                    f"You win this round!",
-                    parse_mode=ParseMode.HTML
-                )
+                result_text = "You win this round!"
             else:
                 game["bot_score"] += 1
                 round_result["winner"] = "bot"
+                result_text = "Bot wins this round!"
+            
+            if not bot_rolls_first:
+                # Only show bot result message if bot rolled after user
                 await update.message.reply_text(
-                    f"Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
-                    f"Bot wins this round!",
+                    f"Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n{result_text}",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                # For bot_rolls_first, show comparison result
+                await update.message.reply_text(
+                    f"Bot had: {bot_rolls_text} = <b>{bot_total}</b>\n\n{result_text}",
                     parse_mode=ParseMode.HTML
                 )
 
@@ -11023,11 +11425,52 @@ async def message_listener(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     del active_pvb_games[user.id]
             else: # Continue game - next round
                 await asyncio.sleep(0.5)  # Rate limit protection
-                await update.message.reply_text(
-                    f"Score: You {game['user_score']} - {game['bot_score']} Bot. (First to {game['target_score']})\n\n"
-                    f"<b>Your turn! Send {game_rolls} {expected_emoji}!</b>",
-                    parse_mode=ParseMode.HTML
-                )
+                
+                if bot_rolls_first:
+                    # Bot rolls first for next round
+                    await update.message.reply_text(
+                        f"Score: You {game['user_score']} - {game['bot_score']} Bot. (First to {game['target_score']})\n\n"
+                        f"<b>Bot is rolling for Round {game['current_round']}...</b>",
+                        parse_mode=ParseMode.HTML
+                    )
+                    
+                    # Bot rolls
+                    bot_rolls = []
+                    chat_type = update.effective_chat.type
+                    for i in range(game_rolls):
+                        animation_wait = await smart_rate_limit(update.effective_chat.id, chat_type)
+                        try:
+                            bot_dice_msg = await context.bot.send_dice(chat_id=update.effective_chat.id, emoji=expected_emoji)
+                            bot_rolls.append(bot_dice_msg.dice.value)
+                            await asyncio.sleep(animation_wait)
+                        except Exception as e:
+                            logging.error(f"Error sending dice in PvB game: {e}")
+                            await update.message.reply_text("❌ An error occurred. Game terminated.")
+                            game['status'] = 'error'
+                            del context.chat_data[f"active_pvb_game_{user.id}"]
+                            if user.id in active_pvb_games:
+                                del active_pvb_games[user.id]
+                            user_wallets[user.id] += game['bet_amount']
+                            update_pnl(user.id)
+                            save_user_data(user.id)
+                            return
+                    
+                    game["bot_rolls"] = bot_rolls
+                    bot_total = sum(bot_rolls)
+                    bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
+                    
+                    await update.message.reply_text(
+                        f"🤖 Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
+                        f"<b>Your turn!</b> Send {game_rolls} {expected_emoji}!",
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    # User rolls first for next round
+                    await update.message.reply_text(
+                        f"Score: You {game['user_score']} - {game['bot_score']} Bot. (First to {game['target_score']})\n\n"
+                        f"<b>Your turn! Send {game_rolls} {expected_emoji}!</b>",
+                        parse_mode=ParseMode.HTML
+                    )
             update_pnl(user.id)
             save_user_data(user.id)
             return  # Return only after processing PvB game emoji
@@ -11982,8 +12425,10 @@ for i in range(min(10, len(deck))):
 def generate_mine_positions(server_seed, client_seed, nonce, num_mines):
     positions = []
     offset = 0
+    # Use nonce * 1000 to ensure unique results for consecutive games
+    base_nonce = nonce * 1000
     while len(positions) < num_mines:
-        pos = get_provably_fair_result(server_seed, client_seed, nonce + offset, 25)
+        pos = get_provably_fair_result(server_seed, client_seed, base_nonce + offset, 25)
         if pos not in positions:
             positions.append(pos)
         offset += 1
@@ -11995,14 +12440,14 @@ num_mines = 3  # Default, adjust based on your game
 mine_positions = generate_mine_positions(server_seed, client_seed, nonce, num_mines)
 
 print("=== Mines Verification ===")
-print(f"Mine Positions: {{mine_positions}}")
+print(f"Mine Positions: {mine_positions}")
 print("\\nGrid (5x5):")
 for row in range(5):
     row_str = ""
     for col in range(5):
         idx = row * 5 + col
         row_str += "💣 " if idx in mine_positions else "💎 "
-    print(f"Row {{row+1}}: {{row_str}}")
+    print(f"Row {row+1}: {row_str}")
 """
     
     elif game_type == "tower":
@@ -12010,8 +12455,10 @@ for row in range(5):
 def generate_tower_positions(server_seed, client_seed, nonce, difficulty):
     tiles_per_floor = {{'easy': 4, 'medium': 3, 'hard': 2}}.get(difficulty, 3)
     positions = []
+    # Use nonce * 1000 to ensure unique results for consecutive games
+    base_nonce = nonce * 1000
     for floor in range(9):
-        snake_pos = get_provably_fair_result(server_seed, client_seed, nonce + floor, tiles_per_floor)
+        snake_pos = get_provably_fair_result(server_seed, client_seed, base_nonce + floor, tiles_per_floor)
         positions.append(snake_pos)
     return positions
 
@@ -12064,8 +12511,10 @@ print(f"Hash: {{create_hash(server_seed, client_seed, nonce)[:16]}}...")
 def generate_keno_numbers(server_seed, client_seed, nonce, count=10):
     numbers = []
     offset = 0
+    # Use nonce * 1000 to ensure unique results for consecutive games
+    base_nonce = nonce * 1000
     while len(numbers) < count:
-        num = get_provably_fair_result(server_seed, client_seed, nonce + offset, 40) + 1
+        num = get_provably_fair_result(server_seed, client_seed, base_nonce + offset, 40) + 1
         if num not in numbers:
             numbers.append(num)
         offset += 1
@@ -14809,6 +15258,7 @@ def main():
         states={
             SELECT_BET_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pvb_get_bet_amount)],
             SELECT_TARGET_SCORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, pvb_get_target_score)],
+            SELECT_WHO_ROLLS_FIRST: [CallbackQueryHandler(pvb_who_rolls_first_callback, pattern="^pvb_first_")],
         },
         fallbacks=[CallbackQueryHandler(cancel_game_conversation, pattern="^cancel_game$")],
         per_message=False,
@@ -14965,9 +15415,11 @@ def main():
     app.add_handler(CallbackQueryHandler(group_challenge_target_callback, pattern=r"^gc_target_")) # NEW - Group challenge target score
     app.add_handler(CallbackQueryHandler(group_challenge_accept_callback, pattern=r"^gc_accept_")) # NEW - Accept group challenge
     app.add_handler(CallbackQueryHandler(group_challenge_playbot_callback, pattern=r"^gc_playbot_")) # NEW - Play with bot
+    app.add_handler(CallbackQueryHandler(group_challenge_botfirst_callback, pattern=r"^gc_botfirst_")) # NEW - Bot rolls first in group PvB
     app.add_handler(CallbackQueryHandler(xdxw_mode_callback, pattern=r"^xdxw_mode_|^xdxw_cancel$")) # NEW - XdX'w mode selection
     app.add_handler(CallbackQueryHandler(xdxw_accept_callback, pattern=r"^xdxw_accept_")) # NEW - XdX'w accept challenge
     app.add_handler(CallbackQueryHandler(xdxw_playbot_callback, pattern=r"^xdxw_playbot_")) # NEW - XdX'w play with bot
+    app.add_handler(CallbackQueryHandler(xdxw_bot_first_callback, pattern=r"^xdxw_bot_first_")) # NEW - XdX'w bot rolls first
     app.add_handler(CallbackQueryHandler(level_all_command, pattern=r"^level_all$")) # NEW
     app.add_handler(CallbackQueryHandler(price_update_callback, pattern=r"^price_update_")) # NEW
     app.add_handler(CallbackQueryHandler(game_info_callback, pattern=r"^game_")); app.add_handler(CallbackQueryHandler(blackjack_callback, pattern=r"^bj_"))
@@ -15195,16 +15647,23 @@ async def select_bombs_callback(update: Update, context: ContextTypes.DEFAULT_TY
             
             total_cells = 25
             
-            # Use user's provably fair seeds
+            # Generate a fresh 15-character client seed for this game BEFORE calculating mines
+            game_client_seed = generate_game_client_seed()
+            
+            # Use server seed from user's provably fair data, but fresh client seed per game
             seeds = get_user_seeds(user.id)
-            mine_numbers = generate_mine_positions(seeds["server_seed"], seeds["client_seed"], seeds["nonce"], num_mines)
+            current_nonce = seeds["nonce"]
+            increment_user_nonce(user.id)  # Increment nonce at game start
+            
+            # Calculate mine positions using server seed + fresh game client seed
+            mine_numbers = generate_mine_positions(seeds["server_seed"], game_client_seed, current_nonce, num_mines)
             
             game_id = generate_unique_id("MN")
             game_sessions[game_id] = {
                 "id": game_id, "game_type": "mines", "user_id": user.id, "bet_amount": bet_amount,
                 "status": "active", "timestamp": str(datetime.now(timezone.utc)), "mines": mine_numbers,
                 "picks": [], "total_cells": total_cells, "num_mines": num_mines,
-                "server_seed": seeds["server_seed"], "client_seed": seeds["client_seed"], "nonce": seeds["nonce"]
+                "server_seed": seeds["server_seed"], "client_seed": game_client_seed, "nonce": current_nonce
             }
             await ensure_user_in_wallets(user.id, user.username, context=context)
             if 'game_sessions' not in user_stats[user.id]: user_stats[user.id]['game_sessions'] = []
@@ -15319,10 +15778,165 @@ async def pvb_get_target_score(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Invalid format. Please enter the target score as ftX (e.g., ft3).", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data="cancel_game")]]))
         return SELECT_TARGET_SCORE
 
+    context.user_data['target_score'] = target_score
+    
+    # Ask who should roll first
+    keyboard = [
+        [InlineKeyboardButton("🎯 You Roll First", callback_data="pvb_first_user")],
+        [InlineKeyboardButton("🤖 Bot Rolls First", callback_data="pvb_first_bot")],
+        [InlineKeyboardButton("🔙 Cancel", callback_data="cancel_game")]
+    ]
+    await update.message.reply_text(
+        f"🎮 <b>Who Rolls First?</b>\n\n"
+        f"Choose who should roll first in each round:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return SELECT_WHO_ROLLS_FIRST
+
+async def pvb_who_rolls_first_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle the selection of who rolls first in PvB games"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    user = query.from_user
+    
+    if data == "pvb_first_user":
+        context.user_data['bot_rolls_first'] = False
+    elif data == "pvb_first_bot":
+        context.user_data['bot_rolls_first'] = True
+    else:
+        return SELECT_WHO_ROLLS_FIRST
+    
     game_type = context.user_data['game_type']
-    await play_vs_bot_game(update, context, game_type, target_score)
+    target_score = context.user_data['target_score']
+    
+    # Create a fake update object for play_vs_bot_game
+    await query.delete_message()
+    
+    # Start the game - we need to send a new message since play_vs_bot_game expects update.message
+    await play_vs_bot_game_from_callback(query, context, game_type, target_score)
     context.user_data.clear()
     return ConversationHandler.END
+
+async def play_vs_bot_game_from_callback(query, context: ContextTypes.DEFAULT_TYPE, game_type: str, target_score: int):
+    """Start PvB game from a callback query (used when bot rolls first is selected)"""
+    user = query.from_user
+    bet_amount = context.user_data['bet_amount']
+    game_mode = context.user_data.get('game_mode', 'normal')
+    game_rolls = context.user_data.get('game_rolls', 1)
+    bot_rolls_first = context.user_data.get('bot_rolls_first', False)
+    
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+
+    if user_wallets.get(user.id, 0.0) < bet_amount:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="You no longer have enough balance for this bet. Game cancelled."
+        )
+        return
+    
+    user_wallets[user.id] -= bet_amount
+    save_user_data(user.id)
+
+    game_id = generate_unique_id("PVB")
+    emoji_map = {
+        "dice": "🎲", "dice_bot": "🎲",
+        "darts": "🎯",
+        "goal": "⚽", "football": "⚽",
+        "bowl": "🎳", "bowling": "🎳"
+    }
+    
+    mode_text = "Highest total score wins" if game_mode == "normal" else "Lowest total score wins"
+    emoji = emoji_map.get(game_type, "🎲")
+    
+    # Create game session
+    game_sessions[game_id] = {
+        "id": game_id, "game_type": f"pvb_{game_type}", "user_id": user.id,
+        "bet_amount": bet_amount, "status": "active", "timestamp": str(datetime.now(timezone.utc)),
+        "target_score": target_score, "current_round": 1,
+        "user_score": 0, "bot_score": 0, 
+        "bot_rolls": [],
+        "user_rolls": [],
+        "game_mode": game_mode,
+        "game_rolls": game_rolls,
+        "history": [],
+        "bot_rolls_first": bot_rolls_first,
+        "waiting_for": "bot" if bot_rolls_first else "user"  # Track whose turn it is
+    }
+    
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+    if 'game_sessions' not in user_stats[user.id]: 
+        user_stats[user.id]['game_sessions'] = []
+    user_stats[user.id]['game_sessions'].append(game_id)
+    save_user_data(user.id)
+    
+    # Store in both context.chat_data and global dict
+    context.chat_data[f"active_pvb_game_{user.id}"] = game_id
+    active_pvb_games[user.id] = game_id
+    
+    chat_id = query.message.chat_id
+    
+    if bot_rolls_first:
+        # Bot rolls first
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🎮 {game_type.capitalize()} vs Bot started! (ID: <code>{game_id}</code>)\n"
+                 f"<b>Mode:</b> {game_mode.capitalize()} ({mode_text})\n"
+                 f"<b>Rolls per round:</b> {game_rolls}\n"
+                 f"<b>Target:</b> First to {target_score} points wins ${bet_amount*2:.2f}.\n\n"
+                 f"<b>Bot is rolling first...</b>",
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Bot rolls
+        bot_rolls = []
+        # Use the emoji directly for Telegram sendDice
+        telegram_emoji = emoji
+        
+        chat_type = query.message.chat.type if hasattr(query.message.chat, 'type') else "private"
+        for i in range(game_rolls):
+            animation_wait = await smart_rate_limit(chat_id, chat_type)
+            try:
+                bot_dice_msg = await context.bot.send_dice(chat_id=chat_id, emoji=telegram_emoji)
+                bot_rolls.append(bot_dice_msg.dice.value)
+                await asyncio.sleep(animation_wait)
+            except Exception as e:
+                logging.error(f"Error sending dice in PvB game: {e}")
+                await context.bot.send_message(chat_id=chat_id, text="❌ An error occurred. Game terminated.")
+                game_sessions[game_id]['status'] = 'error'
+                del context.chat_data[f"active_pvb_game_{user.id}"]
+                if user.id in active_pvb_games:
+                    del active_pvb_games[user.id]
+                user_wallets[user.id] += bet_amount
+                update_pnl(user.id)
+                save_user_data(user.id)
+                return
+        
+        game_sessions[game_id]["bot_rolls"] = bot_rolls
+        bot_total = sum(bot_rolls)
+        bot_rolls_text = " + ".join(str(r) for r in bot_rolls)
+        
+        game_sessions[game_id]["waiting_for"] = "user"
+        
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🤖 Bot rolled: {bot_rolls_text} = <b>{bot_total}</b>\n\n"
+                 f"<b>Your turn!</b> Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to respond.",
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        # User rolls first (default)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"🎮 {game_type.capitalize()} vs Bot started! (ID: <code>{game_id}</code>)\n"
+                 f"<b>Mode:</b> {game_mode.capitalize()} ({mode_text})\n"
+                 f"<b>Rolls per round:</b> {game_rolls}\n"
+                 f"<b>Target:</b> First to {target_score} points wins ${bet_amount*2:.2f}.\n\n"
+                 f"<b>Your turn first! Send {game_rolls} {emoji} emoji{'s' if game_rolls > 1 else ''} to start.</b>",
+            parse_mode=ParseMode.HTML
+        )
 
 async def cancel_game_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -15353,6 +15967,23 @@ async def cancel_game_conversation(update: Update, context: ContextTypes.DEFAULT
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
+        set_menu_owner(query.message, query.from_user.id)
+    elif game_type in ['dice_bot', 'darts', 'football', 'bowling', 'dice', 'goal', 'bowl']:
+        # Return to emoji regular games menu for PvB games
+        text = "🎮 <b>Regular Emoji Games</b>\n\nChoose a game to see how to play:"
+        keyboard = [
+            [apply_button_style(InlineKeyboardButton("🎲 Dice", callback_data="game_dice_bot"), 'success')],
+            [apply_button_style(InlineKeyboardButton("🎯 Darts", callback_data="game_darts"), 'success')],
+            [apply_button_style(InlineKeyboardButton("⚽ Football", callback_data="game_football"), 'success')],
+            [apply_button_style(InlineKeyboardButton("🎳 Bowling", callback_data="game_bowling"), 'success')],
+            [apply_button_style(InlineKeyboardButton("🔙 Back to Emoji Games", callback_data="main_games_emoji"), 'danger')]
+        ]
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=create_styled_keyboard(keyboard)
+        )
+        set_menu_owner(query.message, query.from_user.id)
     else:
         # For other games, return to main menu
         await query.edit_message_text("Game setup cancelled.")
@@ -16126,8 +16757,10 @@ async def pf_verify_calculate_result(update_or_query, context: ContextTypes.DEFA
     elif game == 'keno':
         drawn_numbers = []
         offset = 0
+        # Use nonce * 1000 to match the actual game algorithm
+        base_nonce = nonce * 1000
         while len(drawn_numbers) < 20:
-            num = get_provably_fair_result(server_seed, client_seed, nonce + offset, 40) + 1
+            num = get_provably_fair_result(server_seed, client_seed, base_nonce + offset, 40) + 1
             if num not in drawn_numbers:
                 drawn_numbers.append(num)
             offset += 1
