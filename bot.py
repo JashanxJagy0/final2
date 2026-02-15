@@ -3252,18 +3252,19 @@ def get_provably_fair_result(server_seed, client_seed, nonce, max_value):
     return (hex_value % max_value)
 
 def get_user_seeds(user_id):
-    """Get user's current seeds and nonce"""
-    pf_data = user_stats.get(user_id, {}).get("provably_fair", {})
-    return {
-        "server_seed": pf_data.get("server_seed", generate_server_seed()),
-        "client_seed": pf_data.get("client_seed", generate_client_seed()),
-        "nonce": pf_data.get("nonce", 0)
-    }
-
-def increment_user_nonce(user_id):
-    """Increment user's nonce after a bet"""
+    """Get user's current seeds and nonce - ensures seeds are initialized and saved"""
+    # If user doesn't exist in user_stats, raise an error as callers should ensure user exists
     if user_id not in user_stats:
-        return
+        logging.error(f"get_user_seeds called for non-existent user {user_id} - this should never happen")
+        # Return emergency defaults - but this indicates a bug in calling code
+        emergency_seeds = {
+            "server_seed": generate_server_seed(),
+            "client_seed": generate_client_seed(),
+            "nonce": 0
+        }
+        return emergency_seeds
+    
+    # Initialize provably_fair data if it doesn't exist and SAVE it immediately
     if "provably_fair" not in user_stats[user_id]:
         user_stats[user_id]["provably_fair"] = {
             "server_seed": generate_server_seed(),
@@ -3271,6 +3272,27 @@ def increment_user_nonce(user_id):
             "nonce": 0,
             "next_server_seed": generate_server_seed()
         }
+        save_user_data(user_id)
+        logging.info(f"Initialized provably_fair data for user {user_id}")
+    
+    pf_data = user_stats[user_id]["provably_fair"]
+    return {
+        "server_seed": pf_data.get("server_seed"),
+        "client_seed": pf_data.get("client_seed"),
+        "nonce": pf_data.get("nonce", 0)
+    }
+
+def increment_user_nonce(user_id):
+    """Increment user's nonce after a bet - call get_user_seeds first to ensure initialization"""
+    if user_id not in user_stats:
+        logging.error(f"increment_user_nonce called for non-existent user {user_id}")
+        return
+    
+    # Call get_user_seeds first to ensure provably_fair is properly initialized and saved
+    # This prevents race conditions where we initialize different seeds here
+    if "provably_fair" not in user_stats[user_id]:
+        get_user_seeds(user_id)  # This will initialize and save
+    
     user_stats[user_id]["provably_fair"]["nonce"] += 1
     save_user_data(user_id)
 
